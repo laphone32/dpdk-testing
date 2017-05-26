@@ -34,8 +34,8 @@ static inline int port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 {
 	struct rte_eth_conf port_conf = port_conf_default;
 	const uint16_t rx_rings = 1, tx_rings = 1;
-	int retval;
-	uint16_t q;
+	int retval = 0;
+	uint16_t q = 0;
 
 	if (port >= rte_eth_dev_count())
     {
