@@ -8,19 +8,26 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <rte_eal.h>
-#include <rte_ethdev.h>
 #include <rte_cycles.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 
 #include <arpa/inet.h>
-#include <sys/time.h>
+#include "../common/common.h"
+
 
 #define RX_RING_SIZE 128
 #define TX_RING_SIZE 512
 
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
+
+#define DROP_THRESHOLD 1000000
+
+#define SCALE 1000000
+
+#define BURSTSIZE 16
+#define PACKETLEN 20
 
 static const struct rte_eth_conf port_conf_default = {
     .rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN }
@@ -93,7 +100,7 @@ static inline int port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 }
 
 /* For TX */
-static struct rte_mbuf *txbufs[1];
+static struct rte_mbuf *txbufs[BURSTSIZE];
 
 /*
  * The lcore main. This is the main thread that does the work, reading from
@@ -118,61 +125,65 @@ static __attribute__((noreturn)) void lcore_main(void)
         }
     }
 
+    printf("SLEEP 5\n");
+    sleep(5);
+
     uint64_t start = 0;
     uint64_t stop = 0;
-    
-    struct rte_mbuf *rxbufs[100];
+
+    struct rte_mbuf *rxbufs[BURSTSIZE];
     uint16_t nb_rx = 0;
     uint16_t nb_tx = 0;
 
-      //  struct timeval begin;
-      //  struct timeval end;
-
-//  gettimeofday(&begin, NULL);
-//
-    double unit = (double)rte_get_tsc_hz();
-    start = rte_get_tsc_cycles();
-    sleep(1);
-    stop = rte_get_tsc_cycles();
-//  gettimeofday(&end, NULL);
-
-printf("TEST! stop - start = %ld unit= %f sec=%f\n", (stop - start) , unit, (stop - start)/unit);
-
     int count = 0;
+    int drop_count = 0;
+
+    int scale_count = 0;
+    double latency = 0;
 
     /* Run until the application is quit or killed. */
-    for (;;)
+    while (scale_count < SCALE)
     {
-printf("GO!\n");
+        printf("GO! %d\n", scale_count);
         count = 0;
+        nb_rx = 0;
         /*
          * Send port 0 -> Recv port 1
         */
-//      start = rte_get_tsc_cycles();
-//      gettimeofday(&begin, NULL);
-        nb_tx = rte_eth_tx_burst(0, 0, txbufs, 1);
         start = rte_get_tsc_cycles();
-        stop = rte_get_tsc_cycles();
-
-
-//      start = rte_get_tsc_cycles();
-        while ((nb_rx = rte_eth_rx_burst(1, 0, rxbufs, 64)) == 0)
+        nb_tx = rte_eth_tx_burst(0, 0, txbufs, BURSTSIZE);
+        while (nb_rx < BURSTSIZE)
         {
-            ++ count;
-        };
-//      stop = rte_get_tsc_cycles();
-//      gettimeofday(&end, NULL);
+            nb_rx += rte_eth_rx_burst(1, 0, rxbufs, BURSTSIZE);
 
+            if (++ count > DROP_THRESHOLD)
+            {
+                ++ drop_count;
+                break;
+            }
+        };
+        stop = rte_get_tsc_cycles();
 
         if (unlikely(nb_tx != nb_rx))
         {
-            printf("tx(%d) != rx(%d)\n", nb_tx, nb_rx);
+            printf("LOSS! drop=%d\n", drop_count);
+            continue;
         }
-
-printf("OK! stop - start = %ld, usec=%f count=%d\n", (stop - start), ((double)(stop - start) / unit) * 1000000, count);
-//printf("OK! stop - start = %ld\n", (end.tv_sec - begin.tv_sec) * 1000000 + (end.tv_usec - begin.tv_usec));
-        usleep(10000);
+        else
+        {
+            latency += (tsc2sec(stop - start) * 1000000) / BURSTSIZE;
+//            printf("OK! stop - start = %ld, usec=%f per=%f count=%d drop=%d\n", (stop - start), latency, latency / BURSTSIZE, count, drop_count);
+        }
+    
+        if (++ scale_count >= SCALE)
+        {
+            break;
+        }
     }
+
+    printf("BURSTSIZE=%d PACKETLEN=%d latency=%f drop=%d\n", BURSTSIZE, PACKETLEN, latency / SCALE, drop_count);
+
+    exit(0);
 }
 
 /*
@@ -210,26 +221,13 @@ int main(int argc, char *argv[])
     }
 
     /* Borrow one for TX */
-    if (rte_pktmbuf_alloc_bulk(mbuf_pool, txbufs, 1) != 0)
+    if (rte_pktmbuf_alloc_bulk(mbuf_pool, txbufs, BURSTSIZE) != 0)
     {
         rte_exit(EXIT_FAILURE, "Cannot alloc mbuf for tx\n");
     }
 
 
-//  char msg[10] = "012345678";
-    struct ether_hdr *eth_hdr = NULL;
-    struct rte_mbuf *m = txbufs[0];
-    m->pkt_len = 10 + sizeof(struct ether_hdr);
-    m->data_len = 10 + sizeof(struct ether_hdr);
-
-    eth_hdr = rte_pktmbuf_mtod(m, struct ether_hdr *);
-    rte_eth_macaddr_get(1, &eth_hdr->d_addr);
-    rte_eth_macaddr_get(0, &eth_hdr->s_addr);
-    eth_hdr->ether_type = htons(0x0800);
-//  char* data = rte_pktmbuf_append(m, 10);
-//        if (data != NULL)
-//            rte_memcpy(data, msg, 10);
-
+    initTxPackets(txbufs, BURSTSIZE, PACKETLEN);
 
     /* Initialize all ports. */
     if (port_init(0, mbuf_pool) != 0)
