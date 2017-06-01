@@ -22,10 +22,7 @@
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
 
-#define TX_PORT 0
-#define RX_PORT 1
-
-#define DROP_THRESHOLD 1000000
+#define DROP_THRESHOLD 100000000
 
 #define SCALE 1000000
 
@@ -36,11 +33,21 @@ static const struct rte_eth_conf port_conf_default = {
     .rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN }
 };
 
+enum ports
+{
+    tx_rx_port = 0,
+    rx_tx_port = 1,
+    port_number
+};
+
+
+static struct rte_mempool * _mpool[port_number];
+
 /*
  * Initializes a given port using global settings and with the RX buffers
  * coming from the mbuf_pool passed as a parameter.
  */
-static inline int port_init(uint8_t port, struct rte_mempool *mbuf_pool)
+static inline int port_init(uint8_t port)
 {
     struct rte_eth_conf port_conf = port_conf_default;
     const uint16_t rx_rings = 1, tx_rings = 1;
@@ -62,7 +69,7 @@ static inline int port_init(uint8_t port, struct rte_mempool *mbuf_pool)
     /* Allocate and set up 1 RX queue per Ethernet port. */
     for (q = 0; q < rx_rings; q++)
     {
-        retval = rte_eth_rx_queue_setup(port, q, RX_RING_SIZE, rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+        retval = rte_eth_rx_queue_setup(port, q, RX_RING_SIZE, rte_eth_dev_socket_id(port), NULL, _mpool[port]);
         if (retval < 0)
         {
             return retval;
@@ -99,20 +106,24 @@ static inline int port_init(uint8_t port, struct rte_mempool *mbuf_pool)
     /* Enable RX in promiscuous mode for the Ethernet device. */
     rte_eth_promiscuous_enable(port);
 
+    if (!checkPort(port))
+    {
+        printf("Port %d link status not ready...\n", port);
+        return -1;
+    }
+
     return 0;
 }
-
-/* For TX */
-static struct rte_mbuf *txbufs[BURSTSIZE];
 
 /*
  * The lcore main. This is the main thread that does the work, reading from
  * an input port and writing to an output port.
  */
-static __attribute__((noreturn)) void lcore_main(void)
+static void lcore_tx_rx_main(void)
 {
     const uint8_t nb_ports = rte_eth_dev_count();
     uint8_t port = 0;
+    struct rte_mbuf *txbufs[BURSTSIZE];
 
     /*
      * Check that the port is on the same NUMA node as the polling thread
@@ -127,6 +138,14 @@ static __attribute__((noreturn)) void lcore_main(void)
                     "not be optimal.\n", port);
         }
     }
+
+    /* Borrow one for TX */
+    if (rte_pktmbuf_alloc_bulk(_mpool[tx_rx_port], txbufs, BURSTSIZE) != 0)
+    {
+        rte_exit(EXIT_FAILURE, "Cannot alloc mbuf for tx\n");
+    }
+
+    initTxPackets(txbufs, BURSTSIZE, PACKETLEN);
 
     uint64_t start = 0;
     uint64_t stop = 0;
@@ -148,13 +167,13 @@ static __attribute__((noreturn)) void lcore_main(void)
         count = 0;
         nb_rx = 0;
         /*
-         * Send port 0 -> Recv port 1
+         * Send & Recv port 0
         */
         start = rte_get_tsc_cycles();
-        nb_tx = rte_eth_tx_burst(TX_PORT, 0, txbufs, BURSTSIZE);
+        nb_tx = rte_eth_tx_burst(tx_rx_port, 0, txbufs, BURSTSIZE);
         while (nb_rx < BURSTSIZE)
         {
-            nb_rx += rte_eth_rx_burst(RX_PORT, 0, rxbufs, BURSTSIZE);
+            nb_rx += rte_eth_rx_burst(tx_rx_port, 0, rxbufs, BURSTSIZE);
 
             if (++ count > DROP_THRESHOLD)
             {
@@ -185,13 +204,43 @@ static __attribute__((noreturn)) void lcore_main(void)
     exit(0);
 }
 
+static int lcore_rx_tx_main(void *nonused)
+{
+    (void) nonused;
+
+    struct rte_mbuf *rxbufs[BURSTSIZE];
+    uint16_t nb_rx = 0;
+    uint16_t tx = 0;
+    uint16_t tx_ret = 0;
+
+    while (true)
+    {
+        nb_rx = 0;
+        tx = 0;
+        tx_ret = 0;
+        /*
+         * Recv & Send port 1
+        */
+        nb_rx = rte_eth_rx_burst(rx_tx_port, 0, rxbufs, BURSTSIZE);
+
+        while (nb_rx)
+        {
+            tx_ret = rte_eth_tx_burst(rx_tx_port, 0, rxbufs + tx, nb_rx);
+            nb_rx -= tx_ret;
+            tx += tx_ret;
+        }
+
+    }
+
+    exit(0);
+}
+
 /*
  * The main function, which does initialization and calls the per-lcore
  * functions.
  */
 int main(int argc, char *argv[])
 {
-    struct rte_mempool *mbuf_pool = NULL;
     unsigned nb_ports = 0;
 
     /* Initialize the Environment Abstraction Layer (EAL). */
@@ -211,51 +260,47 @@ int main(int argc, char *argv[])
         rte_exit(EXIT_FAILURE, "Error: nb_ports != 2\n");
     }
 
-    /* Creates a new mempool in memory to hold the mbufs. */
-    mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-
-    if (mbuf_pool == NULL)
+    int count = 0;
+    for (count = 0; count < port_number; ++ count)
     {
-        rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
+        /* Creates a new mempool in memory to hold the mbufs. */
+        char poolName[128] = "\0";
+        sprintf(poolName, "MBUF_POOL_%d", count);
+
+        _mpool[count] = rte_pktmbuf_pool_create(poolName, NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+
+        if (_mpool[count] == NULL)
+        {
+            printf("Cannot create mbuf pool_%d\n", count);
+            return -1;
+        }
     }
-
-    /* Borrow one for TX */
-    if (rte_pktmbuf_alloc_bulk(mbuf_pool, txbufs, BURSTSIZE) != 0)
-    {
-        rte_exit(EXIT_FAILURE, "Cannot alloc mbuf for tx\n");
-    }
-
-
-    initTxPackets(txbufs, BURSTSIZE, PACKETLEN);
 
     /* Initialize all ports. */
-    if (port_init(TX_PORT, mbuf_pool) != 0)
+    if (port_init(tx_rx_port) != 0)
     {
-        rte_exit(EXIT_FAILURE, "Cannot init port 0\n");
+        rte_exit(EXIT_FAILURE, "Cannot init port %d\n", tx_rx_port);
     }
 
-    if (port_init(RX_PORT, mbuf_pool) != 0)
+    if (port_init(rx_tx_port) != 0)
     {
-        rte_exit(EXIT_FAILURE, "Cannot init port 1\n");
+        rte_exit(EXIT_FAILURE, "Cannot init port %d\n", rx_tx_port);
     }
 
-    if (rte_lcore_count() > 1)
+    if (rte_lcore_count() > 2)
     {
-        printf("\nWARNING: Too many lcores enabled. Only 1 used.\n");
+        printf("\nWARNING: Too many lcores enabled. Only 2 used.\n");
+        exit(1);
     }
 
-    if (!checkPort(TX_PORT))
+    /* Fire remote core... */
+    if (rte_eal_mp_remote_launch(&lcore_rx_tx_main, NULL, SKIP_MASTER) != 0)
     {
-        rte_exit(EXIT_FAILURE, "TX port link status not ready...\n");
-    }
-
-    if (!checkPort(RX_PORT))
-    {
-        rte_exit(EXIT_FAILURE, "RX port link status not ready...\n");
+        rte_exit(EXIT_FAILURE, "Fire remote slave core failed...\n");
     }
 
     /* Call lcore_main on the master core only. */
-    lcore_main();
+    lcore_tx_rx_main();
 
     return 0;
 }
